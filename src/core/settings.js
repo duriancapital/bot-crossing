@@ -151,6 +151,17 @@ const DEFAULTS = {
 
   // Behaviour
   autoQuality: true, // drop render scale when frames get expensive
+  /**
+   * Frame pacing. Deliberately absent from every preset's `values`, which is what keeps
+   * `set()` from flipping the preset to 'custom': how often the colony draws is not a
+   * statement about how good it should look, and someone on Ultra who caps the rate is
+   * still on Ultra.
+   *
+   * 30 rather than the display's refresh by default because this is a thing you glance at.
+   * `maxFps: 0` means "whatever the display asks for", which is what it used to do always.
+   */
+  maxFps: 30, // 24 | 30 | 60 | 0 (display refresh)
+  idleFps: 12, // 6 | 12 | 20 | 0 (same as maxFps) — after 45s untouched, or window unfocused
   autoFrame: false, // ease the camera back to isometric when you stop dragging; opt-in
   showFps: false,
   showLabels: true,

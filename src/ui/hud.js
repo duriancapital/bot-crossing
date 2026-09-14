@@ -169,6 +169,33 @@ export class Hud {
         '100% is your display’s own resolution, retina included.'
       ),
       this._toggle('Adaptive quality', 'autoQuality', 'Quietly drops render scale if frames get expensive.'),
+      // Pacing sits next to render scale because it is the same argument — how much work per
+      // second — answered the other way round. A fast machine never trips adaptive quality, so
+      // this is the only knob that helps it.
+      this._select(
+        'Frame rate',
+        'maxFps',
+        [
+          ['24', '24 fps'],
+          ['30', '30 fps'],
+          ['60', '60 fps'],
+          ['0', 'Display'],
+        ],
+        'A colony you glance at. Drawing it less often costs far less than making it look worse.',
+        Number
+      ),
+      this._select(
+        'When idle',
+        'idleFps',
+        [
+          ['6', '6 fps'],
+          ['12', '12 fps'],
+          ['20', '20 fps'],
+          ['0', 'Same'],
+        ],
+        'After 45 seconds without a click, a key or the mouse — or the moment the window loses focus.',
+        Number
+      ),
       this._slider('Scatter', 'scatterDensity', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
       this._slider('Max crew', 'maxAgents', 10, 200, 10, (v) => String(v)),
       this._toggle('Stars', 'stars')
@@ -280,7 +307,8 @@ export class Hud {
     return row
   }
 
-  _select(label, key, options, hint) {
+  /** `parse` is for the settings that are numbers; a `<select>` only ever hands back strings. */
+  _select(label, key, options, hint, parse) {
     const row = this._row(label, hint)
     const sel = document.createElement('select')
     sel.className = 'select'
@@ -290,7 +318,7 @@ export class Hud {
       o.textContent = text
       sel.appendChild(o)
     }
-    sel.addEventListener('change', () => this.settings.set(key, sel.value))
+    sel.addEventListener('change', () => this.settings.set(key, parse ? parse(sel.value) : sel.value))
     row.appendChild(sel)
     this.controls.push({
       el: row,

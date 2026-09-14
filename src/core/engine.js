@@ -6,12 +6,21 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js'
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js'
 import { SHADOW_SIZES } from './settings.js'
 import { createTiltShift } from './tiltshift.js'
+import { FrameGate } from './framerate.js'
 
 /** Safari and friends — not Chrome, which also says "Safari" in its user agent. */
 const IS_WEBKIT =
   typeof navigator !== 'undefined' &&
   /apple/i.test(navigator.vendor || '') &&
   !/chrome|chromium|edg\//i.test(navigator.userAgent || '')
+
+/** What counts as somebody being here. Kept off the canvas: the panels are the colony too. */
+const ACTIVITY_EVENTS = ['pointermove', 'pointerdown', 'wheel', 'keydown', 'touchstart']
+
+/** The largest step the simulation will take at once — see the note in `_loop`. */
+const MAX_STEP = 0.2
+
+const nowMs = () => performance.now()
 
 /**
  * Renderer, post chain, and the frame loop.
@@ -31,6 +40,13 @@ const IS_WEBKIT =
  *    the earlier version did, and it quietly rendered every retina machine at half
  *    resolution — text on the name plates and the badge glyphs magnify hardest, so they
  *    are where a soft buffer shows up first.
+ * 3. **The loop is paced, not just governed.** `setAnimationLoop` asks for a frame at the
+ *    display's refresh rate — 120 a second on a ProMotion panel — and the governor below
+ *    only ever reacts to frames being *slow*. A fast machine is therefore never asked to do
+ *    less: it draws 5.9 megapixels of HDR, bloom and depth of field 120 times a second at a
+ *    window nobody is looking at. `FrameGate` is the missing half of that: it decides how
+ *    *often* to draw, which is the lever that costs nothing visible on a colony you glance
+ *    at, where cutting quality costs the whole point of it.
  */
 export class Engine {
   constructor(settings) {
@@ -87,7 +103,29 @@ export class Engine {
     this._boundLoop = this._loop.bind(this)
     this._onResize = () => this.resize()
 
+    // Frame pacing. Focus starts as whatever the window actually has: a colony opened on a
+    // second monitor while you keep typing somewhere else should start idle, not spend its
+    // first 45 seconds at the full rate.
+    this.gate = new FrameGate({
+      now: nowMs(),
+      focused: typeof document !== 'undefined' ? document.hasFocus() : true,
+    })
+    this._applyFrameRate()
+    // The rates are read through the ordinary settings subscription rather than per frame, so
+    // picking another cap in the panel takes hold on the next animation callback.
+    this._unsubscribe = settings.onChange((changed) => {
+      if (changed.has('maxFps') || changed.has('idleFps')) this._applyFrameRate()
+    })
+
     this.applySettings()
+  }
+
+  /** Idle rate 0 means "same as the frame rate" — one fewer number to reason about. */
+  _applyFrameRate() {
+    const max = Number(this.settings.get('maxFps')) || 0
+    const idle = Number(this.settings.get('idleFps')) || 0
+    this.gate.setRate(max)
+    this.gate.setIdleRate(idle > 0 ? idle : max)
   }
 
   mount(parent) {
@@ -114,6 +152,22 @@ export class Engine {
     document.addEventListener('visibilitychange', this._onWake)
     window.addEventListener('focus', this._onWake)
     window.addEventListener('pageshow', this._onWake)
+
+    // What the frame gate calls "being looked at". Focus is the strong signal — a window
+    // behind another app is not being watched even if the mouse crossed it a second ago —
+    // and the input listeners are what keep the rate up while you are actually using it.
+    // Hidden tabs are already handled: `setAnimationLoop` simply stops being called.
+    this._onFocus = () => {
+      this.gate.setFocused(true)
+      this.gate.noteActivity(nowMs())
+    }
+    this._onBlur = () => this.gate.setFocused(false)
+    this._onActivity = () => this.gate.noteActivity(nowMs())
+    window.addEventListener('focus', this._onFocus)
+    window.addEventListener('blur', this._onBlur)
+    // Passive: none of these are ever cancelled, and saying so keeps scrolling off the
+    // main thread's critical path.
+    for (const type of ACTIVITY_EVENTS) window.addEventListener(type, this._onActivity, { passive: true })
 
     this.resize()
     return this
@@ -286,6 +340,10 @@ export class Engine {
     if (this.running) return
     this.running = true
     this.timer.reset()
+    // Opening the colony counts as somebody being here, and the first frame has no previous
+    // one to be an interval away from.
+    this.gate.noteActivity(nowMs())
+    this._lastFrameAt = null
     this.renderer.setAnimationLoop(this._boundLoop)
   }
 
@@ -295,10 +353,23 @@ export class Engine {
   }
 
   _loop() {
+    const started = nowMs()
+    // Everything below is skipped on a frame the gate turns down — no timer update, no
+    // updaters, no draw. The simulation is not stepped in slow motion, it is simply stepped
+    // less often with a correspondingly larger dt, so the colony keeps real time at every
+    // rate and a capped frame costs exactly nothing.
+    if (!this.gate.shouldRender(started)) return
+
     this.timer.update()
     // The timer already zeroes the delta across a hidden tab; the clamp is the backstop for
     // an ordinary long frame, so one stalled frame never jumps the whole colony forward.
-    const dt = Math.min(this.timer.getDelta(), 0.1)
+    //
+    // It is 0.2s rather than 0.1s because the idle rate is a deliberate 6 fps at its slowest
+    // — a 167ms step that is *real elapsed time*, not a stall — and clamping it would run the
+    // colony slow whenever nobody was looking, which is the one place a drift would quietly
+    // accumulate for hours. Sub-stepping would keep the old clamp, but at the cost of doing
+    // the update work twice on exactly the frames the pacing exists to make cheap.
+    const dt = Math.min(this.timer.getDelta(), MAX_STEP)
     this.elapsed += dt
 
     for (const u of this.updaters) u.update?.(dt, this.elapsed)
@@ -311,7 +382,14 @@ export class Engine {
       this.renderer.render(this.scene, this.camera)
     }
 
-    this.perf.sample(dt, this.renderer.info)
+    // Two different numbers, and conflating them is what breaks a capped loop: the interval
+    // between frames is the cap once there is one, and says nothing about the machine. What
+    // the governor needs is how long the work took. (CPU time around the draw call, since
+    // WebGL has no cheap GPU clock — but a GPU that is behind blocks the submit, so a real
+    // overload still lands in this number.)
+    const interval = started - (this._lastFrameAt ?? started)
+    this._lastFrameAt = started
+    this.perf.sample(nowMs() - started, interval, this.renderer.info)
     if (this.settings.get('autoQuality')) this._governQuality()
   }
 
@@ -344,9 +422,18 @@ export class Engine {
     const now = performance.now()
     if (now - (this._lastGovern || 0) < 1000) return
     this._lastGovern = now
+    // Nothing to govern for an empty room. Every move here resizes the drawing buffer, and
+    // doing that to a window nobody is looking at is churn with no audience.
+    if (this.gate.isIdle(now)) return
 
-    const fps = this.perf.fps
-    if (fps <= 0) return
+    // The *work* per frame, not the interval between frames. Under a 30 fps cap every
+    // interval is ~33ms, which the old reading took for a struggling machine — and the
+    // governor would then drop render scale on the fastest laptop made, forever, because
+    // the evidence it was reading was its own cap. 22ms and 17ms are the same bar as the
+    // 45 fps / 58 fps it used to compare against, just measured on the half that is about
+    // the machine.
+    const cost = this.perf.frameMs
+    if (cost <= 0) return
     const ceiling = this._targetScale()
     const current = this.viewport?.scale ?? ceiling
     // The floor is half the display's own resolution, not half a CSS pixel: on a retina
@@ -355,8 +442,8 @@ export class Engine {
     const floor = 0.35 * (window.devicePixelRatio || 1)
 
     // Sustained evidence, not one sample: 3 slow seconds to drop, 8 fast ones to climb.
-    this._slow = fps < 45 ? (this._slow || 0) + 1 : 0
-    this._fast = fps > 58 ? (this._fast || 0) + 1 : 0
+    this._slow = cost > 22 ? (this._slow || 0) + 1 : 0
+    this._fast = cost < 17 ? (this._fast || 0) + 1 : 0
     const dpr = window.devicePixelRatio || 1
 
     let next = current
@@ -388,32 +475,48 @@ export class Engine {
   dispose() {
     this.stop()
     this.timer.dispose()
+    this._unsubscribe?.()
     window.removeEventListener('resize', this._onResize)
     this._dprQuery?.removeEventListener?.('change', this._onResize)
     this._observer?.disconnect()
     document.removeEventListener('visibilitychange', this._onWake)
     window.removeEventListener('focus', this._onWake)
     window.removeEventListener('pageshow', this._onWake)
+    if (this._onFocus) {
+      window.removeEventListener('focus', this._onFocus)
+      window.removeEventListener('blur', this._onBlur)
+      for (const type of ACTIVITY_EVENTS) window.removeEventListener(type, this._onActivity)
+    }
     this._disposeComposer()
     this.renderer.dispose()
   }
 }
 
-/** Rolling frame stats — an EMA so the readout does not flicker on a single slow frame. */
+/**
+ * Rolling frame stats — an EMA so the readout does not flicker on a single slow frame.
+ *
+ * Two clocks, because under a frame cap they are no longer the same one:
+ * `frameMs` is what a frame *cost* (the governor's evidence about the machine) and `fps` is
+ * how often frames are actually reaching the screen (what the readout promises). Capped to
+ * 30, a healthy machine reads "30 fps · 6 ms", which is the honest description of both.
+ */
 class PerfMonitor {
   constructor() {
     this.fps = 0
     this.frameMs = 0
+    this.intervalMs = 0
     this.drawCalls = 0
     this.triangles = 0
     this._frames = 0
   }
 
-  sample(dt, info) {
-    const ms = dt * 1000
+  sample(workMs, intervalMs, info) {
     const k = this._frames < 10 ? 0.3 : 0.06
-    this.frameMs += (ms - this.frameMs) * k
-    this.fps = this.frameMs > 0 ? 1000 / this.frameMs : 0
+    this.frameMs += (workMs - this.frameMs) * k
+    if (intervalMs > 0) {
+      this.intervalMs += (intervalMs - this.intervalMs) * k
+      this.fps = this.intervalMs > 0 ? 1000 / this.intervalMs : 0
+    }
     this._frames++
     if (this._frames % 10 === 0) {
       this.drawCalls = info.render.calls
