@@ -27,11 +27,37 @@ second process. For a built version, `npm start` (build + serve) or `npm run ser
 `dist/` already exists. Binds to `127.0.0.1` by default, and answers only its own page — see
 [Keeping it local](#keeping-it-local).
 
+The built server compresses what it sends — brotli or gzip, whichever the browser asks for, each
+file encoded once and kept in memory — so the 890 KB bundle crosses the wire at about 245 KB and
+each fifteen-second thread poll at roughly a seventh of its size. It still needs no npm packages
+at all to run: `server/` imports only Node built-ins.
+
 **macOS, Linux and Windows.** Opening a thread, revealing a folder and starting a new session
 all go through a `harness://` deep link handed to the OS opener — `open(1)` on macOS,
 `xdg-open` on Linux, ShellExecute on Windows. The scanning half was portable already. On Linux,
 where a desktop app often is not installed, the scheme is checked first and a terminal running
 the harness's own CLI opens instead when nothing answers it.
+
+### Launching and closing it
+
+`bin/bot-crossing` runs the built app as one plain Node process and nothing else — no daemon, no
+launchd agent, and nothing left behind once it is off:
+
+```bash
+bin/bot-crossing start    # build if needed, serve on 127.0.0.1:5274, open the browser
+bin/bot-crossing stop     # stop it; nothing keeps running
+bin/bot-crossing toggle   # whichever of the two applies, with a notification
+bin/bot-crossing status
+```
+
+`npm run up` and `npm run down` are the first two. It picks the newest Node it can find among
+Homebrew's `node`, `node@24`, `node@23` and `node@22` kegs, so Codex thread titles work even when
+the `node` on your PATH is older than 22.13; it rebuilds `dist/` only when a source file is newer
+than it; and `stop` will only ever kill a process whose command line is this project's server — a
+stranger on the port is reported and left alone.
+
+For a Dock button, `bin/bot-crossing install-app` compiles a tiny "Bot Crossing.app" (gitignored)
+whose one action is `toggle`: click to start and open, click again to stop.
 
 ## Which harnesses work
 
@@ -412,6 +438,14 @@ mannequin's own bones**. Merging glTF documents brings each animation file's pri
 rig along with it, so without that step the finished file has five skeletons named `hips` and
 the clips drive the four nobody is looking at. It loads without a single warning and renders the
 entire crew frozen in its bind pose.
+
+Both packers finish by **quantizing every vertex attribute except position** with
+`KHR_mesh_quantization` — normals, UVs, joints and weights stored as bytes and shorts rather than
+floats — which is what takes the three files from 3.9 MB to 2.1 MB. Position stays float32 on
+purpose: `world/buildings.js` scales and translates kit geometry in place and `agents/crew.js`
+reads vertices raw, so an int16 position would shrink every building and scatter the crew.
+`tools/quantize-assets.mjs` carries the full reasoning, and `npm run assets:quantize` applies the
+same step to the checked-in files in place — safe to re-run, since it lands on the same bytes.
 
 ## Animating the crew
 

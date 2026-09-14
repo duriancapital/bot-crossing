@@ -1,6 +1,7 @@
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { openInTerminal, schemeHasHandler, schemeOf } from './lib/xdg.mjs'
@@ -270,13 +271,66 @@ async function reconcileArchived(threads) {
   return threads.map((t) => (archived(t) ? { ...t, archived: true } : t))
 }
 
-function send(res, status, body) {
-  const payload = JSON.stringify(body)
-  res.writeHead(status, {
+/**
+ * Content negotiation, shared with the static server.
+ *
+ * It lives here rather than in serve.mjs because serve.mjs already imports this file, and the
+ * other direction would be a cycle for the sake of ten lines. Brotli first (~15% smaller than
+ * gzip on JSON and on the bundle), then gzip, then nothing. `q=0` is an explicit refusal — a
+ * client that says `gzip;q=0` must never be handed gzip — and a bare `*` accepts anything.
+ */
+export function acceptedEncoding(header) {
+  const offered = new Map()
+  for (const part of String(header || '').split(',')) {
+    const [token, ...params] = part.trim().toLowerCase().split(';')
+    if (!token) continue
+    const q = params.map((p) => p.trim()).find((p) => p.startsWith('q='))
+    offered.set(token, q ? Number(q.slice(2)) || 0 : 1)
+  }
+  const ok = (name) => (offered.has(name) ? offered.get(name) > 0 : (offered.get('*') || 0) > 0)
+  if (ok('br')) return 'br'
+  if (ok('gzip')) return 'gzip'
+  return 'identity'
+}
+
+/**
+ * Anything smaller than this costs more than it saves: gzip's framing alone is ~20 bytes, and a
+ * few hundred bytes of JSON is one packet either way.
+ */
+const MIN_COMPRESS = 1024
+
+/**
+ * Brotli's default quality is 11, which on a few hundred KB takes long enough to be felt. Unlike
+ * dist/, these bodies are new every time and cannot be cached, so the setting has to be one that
+ * is affordable *per request*: at 5 it is about as fast as gzip and still compresses better.
+ */
+const BROTLI_DYNAMIC = { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 } }
+
+/**
+ * JSON out, compressed when the caller can read it and the payload is big enough to be worth it.
+ *
+ * `/api/threads` on a machine with ~850 sessions is several hundred KB, and the page re-polls it
+ * every 15 seconds: over a LAN that one response dominates everything else this server does.
+ * `req` is optional so the shape of a plain `send(res, status, body)` still works — without it
+ * there is simply no `Accept-Encoding` to honour.
+ */
+function send(res, status, body, req) {
+  let payload = Buffer.from(JSON.stringify(body), 'utf8')
+  const encoding =
+    payload.length > MIN_COMPRESS ? acceptedEncoding(req && req.headers['accept-encoding']) : 'identity'
+  const headers = {
     'Content-Type': 'application/json',
     'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(payload),
-  })
+    // Nothing should be caching a no-store response, but if anything does it must not reuse this
+    // body for a client that asked for a different encoding.
+    Vary: 'Accept-Encoding',
+  }
+  if (encoding !== 'identity') {
+    payload = encoding === 'br' ? zlib.brotliCompressSync(payload, BROTLI_DYNAMIC) : zlib.gzipSync(payload)
+    headers['Content-Encoding'] = encoding
+  }
+  headers['Content-Length'] = payload.length
+  res.writeHead(status, headers)
   res.end(payload)
 }
 
@@ -355,10 +409,12 @@ function readJsonBody(req, limit = 4 * 1024 * 1024) {
 /** Connect-style middleware: handles /api/*, passes everything else through. */
 export async function apiMiddleware(req, res, next) {
   const url = new URL(req.url, 'http://localhost')
-  if (!url.pathname.startsWith('/api/')) return next ? next() : send(res, 404, { error: 'Not found' })
+  if (!url.pathname.startsWith('/api/')) {
+    return next ? next() : send(res, 404, { error: 'Not found' }, req)
+  }
 
   if (!isLocalRequest(req)) {
-    return send(res, 403, { error: 'Bot Crossing only answers its own page on this machine' })
+    return send(res, 403, { error: 'Bot Crossing only answers its own page on this machine' }, req)
   }
 
   try {
@@ -367,15 +423,15 @@ export async function apiMiddleware(req, res, next) {
       // A harness that is present but cannot read its own store says so here, rather than
       // appearing healthy in the list while quietly contributing nothing.
       const warnings = (await harnessStatus()).filter((h) => h.detected && h.error).map((h) => h.error)
-      return send(res, 200, { threads, scannedAt: Date.now(), warnings })
+      return send(res, 200, { threads, scannedAt: Date.now(), warnings }, req)
     }
 
     if (url.pathname === '/api/harnesses' && req.method === 'GET') {
-      return send(res, 200, { harnesses: await harnessStatus() })
+      return send(res, 200, { harnesses: await harnessStatus() }, req)
     }
 
     if (url.pathname === '/api/state' && req.method === 'GET') {
-      return send(res, 200, await readState())
+      return send(res, 200, await readState(), req)
     }
 
     /**
@@ -400,32 +456,34 @@ export async function apiMiddleware(req, res, next) {
       const base = Number(body.baseUpdatedAt) || 0
       return serialise(async () => {
         const current = await readState()
-        if (base && current.updatedAt !== base) return send(res, 409, current)
-        return send(res, 200, await writeState(body))
+        if (base && current.updatedAt !== base) return send(res, 409, current, req)
+        return send(res, 200, await writeState(body), req)
       })
     }
 
     if (url.pathname === '/api/open' && req.method === 'POST') {
       const { harness, ref } = await readJsonBody(req)
       const shown = await present(await harnessOpenThread(harness, ref))
-      return send(res, shown.ok ? 200 : 400, shown)
+      return send(res, shown.ok ? 200 : 400, shown, req)
     }
 
     if ((url.pathname === '/api/new-session' || url.pathname === '/api/reveal') && req.method === 'POST') {
       const { folder, harness } = await readJsonBody(req)
       const dir = await resolveFolder(folder)
-      if (!dir) return send(res, 400, { ok: false, error: 'That folder is not on this machine any more' })
+      if (!dir) {
+        return send(res, 400, { ok: false, error: 'That folder is not on this machine any more' }, req)
+      }
 
       if (url.pathname === '/api/reveal') {
         launch(dir)
-        return send(res, 200, { ok: true })
+        return send(res, 200, { ok: true }, req)
       }
       const shown = await present(await harnessNewSession(harness || (await defaultHarness()), dir))
-      return send(res, shown.ok ? 200 : 400, shown)
+      return send(res, shown.ok ? 200 : 400, shown, req)
     }
 
-    return send(res, 404, { error: 'Unknown endpoint' })
+    return send(res, 404, { error: 'Unknown endpoint' }, req)
   } catch (err) {
-    return send(res, 500, { error: String(err && err.message ? err.message : err) })
+    return send(res, 500, { error: String(err && err.message ? err.message : err) }, req)
   }
 }

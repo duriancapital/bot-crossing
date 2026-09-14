@@ -6,6 +6,12 @@ dist
 data/*.json
 data/*.tmp
 
+# Written by bin/bot-crossing while the local server is running.
+data/*.pid
+
+# "Bot Crossing.app" — the Dock launcher built locally by `bin/bot-crossing install-app`.
+*.app
+
 # Per-machine Claude Code permissions — personal paths live in here.
 .claude/settings.local.json
 

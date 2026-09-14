@@ -10,10 +10,10 @@
  * Usage: build-kit.mjs <src-gltf-dir> <out.glb> [model,model,...]
  * With no model list, everything in the directory is packed.
  */
-import { NodeIO } from '@gltf-transform/core'
-import { dedup, mergeDocuments, prune, unpartition, weld } from '@gltf-transform/functions'
+import { dedup, mergeDocuments, prune, quantize, resample, unpartition, weld } from '@gltf-transform/functions'
 import { existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
+import { assertFloatPositions, declareQuantization, QUANTIZE_ATTRIBUTES, quantizingIO } from './quantize-assets.mjs'
 
 const [SRC, OUT, WANTED] = process.argv.slice(2)
 if (!SRC || !OUT) {
@@ -44,7 +44,7 @@ if (keep) {
 }
 if (!files.length) throw new Error(`${SRC}: nothing to pack`)
 
-const io = new NodeIO()
+const io = quantizingIO()
 const doc = await io.read(join(SRC, files[0]))
 const scene = doc.getRoot().getDefaultScene()
 
@@ -63,9 +63,16 @@ for (const s of doc.getRoot().listScenes()) {
 await doc.transform(
   weld(),
   dedup(), // every model carries its own copy of one atlas and one material
+  resample(),
+  // Normals and UVs as shorts rather than floats, which is most of the file. POSITION is
+  // deliberately left alone — see QUANTIZE_ATTRIBUTES for why the runtime needs it float.
+  quantize({ pattern: QUANTIZE_ATTRIBUTES }),
   prune(),
   unpartition() // merged documents each bring their own buffer; a glb may only have one
 )
+
+assertFloatPositions(doc, basename(OUT))
+declareQuantization(doc)
 
 const root = doc.getRoot()
 console.log(`${basename(OUT)}: ${scene.listChildren().length} nodes, ${root.listMaterials().length} material, ${root.listTextures().length} texture`)

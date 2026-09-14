@@ -8,9 +8,9 @@
  *
  * Both packs are CC0 (Kay Lousberg, kaylousberg.com).
  */
-import { NodeIO } from '@gltf-transform/core'
-import { dedup, mergeDocuments, prune, unpartition } from '@gltf-transform/functions'
+import { dedup, mergeDocuments, prune, quantize, resample, unpartition } from '@gltf-transform/functions'
 import { existsSync, mkdirSync } from 'node:fs'
+import { assertFloatPositions, declareQuantization, QUANTIZE_ATTRIBUTES, quantizingIO } from './quantize-assets.mjs'
 
 const SRC = 'assets-src/KayKit_Character_Animations_1.1'
 const MANNEQUIN = `${SRC}/Mannequin Character/characters/Mannequin_Medium.glb`
@@ -39,7 +39,7 @@ if (!existsSync(SRC)) {
   process.exit(1)
 }
 
-const io = new NodeIO()
+const io = quantizingIO()
 const doc = await io.read(MANNEQUIN)
 
 for (const [file, clips] of Object.entries(WANTED)) {
@@ -119,7 +119,19 @@ for (const node of root.listNodes()) if (!live.has(node)) node.dispose()
 for (const mesh of root.listMeshes()) if (!liveMeshes.has(mesh)) mesh.dispose()
 for (const skin of root.listSkins()) if (!liveSkins.has(skin)) skin.dispose()
 
-await doc.transform(dedup(), prune({ keepAttributes: false }), unpartition())
+// resample() drops the constant keyframes the clips are full of, and quantize() puts the
+// skin's joints, weights and normals in shorts — together most of the crew's file size.
+// POSITION stays float: see QUANTIZE_ATTRIBUTES for what reads it raw at runtime.
+await doc.transform(
+  dedup(),
+  resample(),
+  quantize({ pattern: QUANTIZE_ATTRIBUTES }),
+  prune({ keepAttributes: false }),
+  unpartition()
+)
+
+assertFloatPositions(doc, 'crew.glb')
+declareQuantization(doc)
 
 // A duplicate name would make three's loader rename one of them at parse time, and the
 // clips would miss again — this time silently, so it is worth an assertion.

@@ -36,7 +36,10 @@
     "build": "npm run assets --silent && vite build",
     "start": "vite build && node server/serve.mjs",
     "serve": "node server/serve.mjs",
+    "up": "bin/bot-crossing start",
+    "down": "bin/bot-crossing stop",
     "assets": "node tools/build-assets.mjs",
+    "assets:quantize": "node tools/quantize-assets.mjs",
     "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {
@@ -45,6 +48,7 @@
   },
   "devDependencies": {
     "@gltf-transform/core": "^4.4.2",
+    "@gltf-transform/extensions": "^4.4.2",
     "@gltf-transform/functions": "^4.4.2",
     "vite": "^7.1.0"
   }

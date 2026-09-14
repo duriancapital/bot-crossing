@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+#
+# bot-crossing — start, stop and toggle the local Bot Crossing app.
+#
+# The whole point of this script is that Bot Crossing costs nothing when you are not
+# looking at it: no launchd agent, no daemon, no supervisor. `start` forks one plain
+# node process and records its PID; `stop` kills that process and leaves nothing behind.
+# The macOS app produced by `install-app` is a thin wrapper around `toggle`, so a single
+# click in the Dock is the whole user interface for running and quitting the server.
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Where we are
+# ---------------------------------------------------------------------------
+
+# Resolve this script's real location so the repo root is right even when bin/bot-crossing
+# is reached through a symlink (e.g. someone links it into ~/bin). The .app created by
+# install-app calls the absolute path, but a symlinked copy should work too.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  link_target="$(readlink "$self")"
+  case "$link_target" in
+    /*) self="$link_target" ;;
+    *) self="$(cd -P "$(dirname "$self")" && pwd)/$link_target" ;;
+  esac
+done
+BIN_DIR="$(cd -P "$(dirname "$self")" && pwd)"
+ROOT="$(cd -P "$BIN_DIR/.." && pwd)"
+SELF_PATH="$BIN_DIR/$(basename "$self")"
+
+cd "$ROOT"
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+# PORT / BOT_CROSSING_HOST come from the environment so a second copy can run alongside
+# the first (server/serve.mjs reads exactly these two variables).
+PORT="${PORT:-5274}"
+BOT_CROSSING_HOST="${BOT_CROSSING_HOST:-127.0.0.1}"
+
+DATA_DIR="$ROOT/data"
+PIDFILE="$DATA_DIR/server.pid"
+LOGFILE="$DATA_DIR/server.log"
+# Always probe over the loopback address: the server may be bound to 0.0.0.0 or to a LAN
+# address, but 127.0.0.1 is what we can reliably reach from this machine.
+URL="http://127.0.0.1:$PORT/"
+SERVER_ENTRY="server/serve.mjs"
+
+# data/ holds the colony state, the pidfile and the log. It is gitignored, and it may not
+# exist on a fresh clone, so create it before anything tries to write there.
+mkdir -p "$DATA_DIR"
+
+# ---------------------------------------------------------------------------
+# Node selection
+# ---------------------------------------------------------------------------
+
+# package.json wants Node >= 22.13 because the Codex harness reads thread titles out of
+# SQLite through node:sqlite, which only landed in 22.13. On this kind of machine the
+# `node` first on PATH is often an older Homebrew keg (22.12), while a newer keg sits
+# right next to it — so rather than failing, or forcing the user to fiddle with PATH, we
+# look through the usual Homebrew locations and take the first one new enough.
+NODE_CANDIDATES=(
+  "node"
+  "/opt/homebrew/opt/node/bin/node"
+  "/opt/homebrew/opt/node@24/bin/node"
+  "/opt/homebrew/opt/node@23/bin/node"
+  "/opt/homebrew/opt/node@22/bin/node"
+)
+
+# node_version_ok BIN — true when BIN reports a version >= 22.13. Major and minor are
+# compared as numbers, because a string compare would rank "22.9" above "22.13".
+node_version_ok() {
+  local bin="$1" raw major minor rest
+  raw="$("$bin" --version 2>/dev/null)" || return 1
+  raw="${raw#v}"
+  major="${raw%%.*}"
+  rest="${raw#*.}"
+  minor="${rest%%.*}"
+  case "$major$minor" in
+    *[!0-9]* | "") return 1 ;;
+  esac
+  if [ "$major" -gt 22 ]; then return 0; fi
+  if [ "$major" -eq 22 ] && [ "$minor" -ge 13 ]; then return 0; fi
+  return 1
+}
+
+NODE_BIN=""
+
+pick_node() {
+  # Memoised: several subcommands call this and each call shells out to `node --version`.
+  if [ -n "$NODE_BIN" ]; then return 0; fi
+  local candidate resolved
+  for candidate in "${NODE_CANDIDATES[@]}"; do
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    [ -n "$resolved" ] || continue
+    [ -x "$resolved" ] || continue
+    if node_version_ok "$resolved"; then
+      NODE_BIN="$resolved"
+      # Put the chosen Node first on PATH so `npx vite build` runs under the same
+      # interpreter as the server, instead of whatever npx the shell happens to find.
+      PATH="$(dirname "$NODE_BIN"):$PATH"
+      export PATH
+      return 0
+    fi
+  done
+  # No new-enough Node anywhere: still run, but say what will be missing rather than
+  # refusing to start the whole app over one optional feature.
+  NODE_BIN="$(command -v node 2>/dev/null || echo node)"
+  echo "warning: no Node >= 22.13 found; Codex thread titles need 22.13+ (using $("$NODE_BIN" --version 2>/dev/null || echo unknown))" >&2
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Process helpers
+# ---------------------------------------------------------------------------
+
+# pid_alive PID — the process exists and we may signal it.
+pid_alive() {
+  local pid="${1:-}"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# pid_is_server PID — the process is *our* server and not some unrelated program that
+# happens to have inherited the same PID number after a reboot or a PID wrap. We check
+# the recorded command line rather than trusting the pidfile, because killing a stranger
+# because of a stale file is the one genuinely destructive thing this script could do.
+pid_is_server() {
+  local pid="${1:-}" cmd
+  [ -n "$pid" ] || return 1
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+  case "$cmd" in
+    *"$SERVER_ENTRY"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+read_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid
+  pid="$(tr -d '[:space:]' <"$PIDFILE" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  case "$pid" in
+    *[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$pid"
+}
+
+# port_answers — the server is actually serving, not merely a live process that is stuck
+# or still booting. This is what makes `start` idempotent.
+port_answers() {
+  curl -fsS --max-time 2 -o /dev/null "$URL" 2>/dev/null
+}
+
+# is_running — the strict definition used by start/status/toggle: a recorded process that
+# is alive *and* a port that answers.
+is_running() {
+  local pid
+  pid="$(read_pid || true)"
+  [ -n "$pid" ] || return 1
+  pid_alive "$pid" || return 1
+  port_answers || return 1
+  return 0
+}
+
+# port_listeners — PIDs holding the TCP port open. Used only as a safety net in `stop`.
+port_listeners() {
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null || true
+}
+
+notify() {
+  # A failing notification must never fail the command the user actually asked for —
+  # osascript can be blocked by TCC, or absent entirely in a stripped environment.
+  osascript -e "display notification \"$1\" with title \"Bot Crossing\"" >/dev/null 2>&1 || true
+}
+
+open_url() {
+  # BOT_CROSSING_NO_OPEN=1 is the environment equivalent of --no-open, so scripts and
+  # tests can drive this without a browser window appearing.
+  if [ "${BOT_CROSSING_NO_OPEN:-}" = "1" ]; then return 0; fi
+  open "$URL" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+ensure_deps() {
+  if [ ! -d "$ROOT/node_modules" ]; then
+    echo "Installing dependencies…"
+    # --ignore-scripts: nothing in this project needs postinstall hooks, and skipping them
+    # keeps a double-click launch from running arbitrary package code.
+    npm ci --ignore-scripts
+  fi
+}
+
+# needs_build — true when dist/ is missing or older than any source file. Rebuilding
+# unconditionally would add ~10s of vite to every single click on the Dock icon, and the
+# common case is that nothing changed since the last run, so compare mtimes instead.
+needs_build() {
+  [ -f "$ROOT/dist/index.html" ] || return 0
+  local sources=() newer
+  [ -d "$ROOT/src" ] && sources+=("$ROOT/src")
+  [ -d "$ROOT/public" ] && sources+=("$ROOT/public")
+  [ -f "$ROOT/index.html" ] && sources+=("$ROOT/index.html")
+  [ -f "$ROOT/vite.config.js" ] && sources+=("$ROOT/vite.config.js")
+  [ ${#sources[@]} -gt 0 ] || return 1
+  newer="$(find "${sources[@]}" -type f -newer "$ROOT/dist/index.html" -print 2>/dev/null | head -n 1 || true)"
+  [ -n "$newer" ]
+}
+
+run_build() {
+  echo "Building…"
+  npx vite build
+}
+
+ensure_build() {
+  ensure_deps
+  if needs_build; then
+    run_build
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+  local no_open=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --no-open) no_open=1 ;;
+      *) echo "start: unknown option '$arg'" >&2; return 2 ;;
+    esac
+  done
+
+  if is_running; then
+    local pid
+    pid="$(read_pid)"
+    echo "Bot Crossing already running → $URL (pid $pid)"
+    [ "$no_open" -eq 1 ] || open_url
+    return 0
+  fi
+
+  # A pidfile can survive a crash or a reboot. Clear it before starting so `status` never
+  # reports a PID that belongs to nothing (or to somebody else).
+  rm -f "$PIDFILE"
+
+  pick_node
+  ensure_build
+
+  # Detached on purpose: nohup plus a full redirect of stdin/stdout/stderr, then disown,
+  # so the server outlives this shell — including the very short-lived shell that the
+  # .app's `do shell script` gives us.
+  PORT="$PORT" BOT_CROSSING_HOST="$BOT_CROSSING_HOST" \
+    nohup "$NODE_BIN" "$SERVER_ENTRY" >>"$LOGFILE" 2>&1 </dev/null &
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+  printf '%s\n' "$pid" >"$PIDFILE"
+
+  # Poll rather than sleeping a fixed amount: usually the port answers in well under a
+  # second, and waiting the full timeout would make the Dock click feel broken.
+  local waited=0
+  while [ "$waited" -lt 32 ]; do
+    if port_answers; then
+      echo "Bot Crossing running → $URL (pid $pid, log $LOGFILE)"
+      [ "$no_open" -eq 1 ] || open_url
+      return 0
+    fi
+    if ! pid_alive "$pid"; then
+      rm -f "$PIDFILE"
+      echo "Bot Crossing failed to start — last lines of $LOGFILE:" >&2
+      tail -n 20 "$LOGFILE" >&2 || true
+      return 1
+    fi
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+
+  echo "Bot Crossing did not answer on $URL within 8s (pid $pid, log $LOGFILE)" >&2
+  return 1
+}
+
+cmd_stop() {
+  local stopped=0 pid
+
+  pid="$(read_pid || true)"
+  if [ -n "$pid" ] && pid_alive "$pid" && pid_is_server "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while [ "$waited" -lt 12 ] && pid_alive "$pid"; do
+      sleep 0.25
+      waited=$((waited + 1))
+    done
+    # Still there after 3s of polite asking — it is not going to close on its own.
+    if pid_alive "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+      sleep 0.25
+    fi
+    stopped=1
+  fi
+  rm -f "$PIDFILE"
+
+  # Safety net for a stale or deleted pidfile: whoever is holding the port is very
+  # probably the server we lost track of. We only kill it after confirming its command
+  # line mentions server/serve.mjs — the port could just as easily have been taken by the
+  # user's own dev server, another project, or something important, and this script must
+  # never kill a process it cannot positively identify as ours.
+  local lpid w
+  # Word splitting on the PID list is intended — lsof -t prints one PID per line.
+  for lpid in $(port_listeners); do
+    if pid_is_server "$lpid"; then
+      kill -TERM "$lpid" 2>/dev/null || true
+      w=0
+      while [ "$w" -lt 12 ] && pid_alive "$lpid"; do
+        sleep 0.25
+        w=$((w + 1))
+      done
+      if pid_alive "$lpid"; then kill -KILL "$lpid" 2>/dev/null || true; fi
+      stopped=1
+    else
+      echo "note: something else is listening on port $PORT (pid $lpid) — left alone" >&2
+    fi
+  done
+
+  # Confirm rather than assume: a "stopped" that left the server running would be worse
+  # than no message at all. If the port still answers we ask who owns it — a stranger
+  # squatting on the port is not our failure to report as one.
+  sleep 0.25
+  if port_answers; then
+    local ours_left=0
+    for lpid in $(port_listeners); do
+      if pid_is_server "$lpid"; then ours_left=1; fi
+    done
+    if [ "$ours_left" -eq 1 ]; then
+      echo "Bot Crossing is still answering on $URL — could not stop it" >&2
+      return 1
+    fi
+    echo "note: port $PORT is still in use by something else; no Bot Crossing server is running" >&2
+  fi
+
+  if [ "$stopped" -eq 1 ]; then
+    echo "stopped"
+  else
+    echo "was not running"
+  fi
+  return 0
+}
+
+cmd_status() {
+  local pid
+  pid="$(read_pid || true)"
+  if is_running; then
+    echo "Bot Crossing: running"
+    echo "  pid:  $pid"
+    echo "  port: $PORT"
+    echo "  url:  $URL"
+    echo "  log:  $LOGFILE"
+    return 0
+  fi
+  echo "Bot Crossing: not running"
+  if [ -n "$pid" ]; then
+    echo "  pid:  $pid (stale pidfile — process gone or not answering)"
+  else
+    echo "  pid:  —"
+  fi
+  echo "  port: $PORT"
+  echo "  url:  $URL"
+  echo "  log:  $LOGFILE"
+  return 1
+}
+
+cmd_toggle() {
+  if is_running; then
+    cmd_stop
+    notify "Stopped — nothing running now."
+  else
+    cmd_start "$@"
+    notify "Running at $URL"
+  fi
+}
+
+cmd_open() {
+  if ! is_running; then
+    cmd_start --no-open
+  fi
+  # `open` was asked for explicitly, so it opens the browser even when the start above was
+  # told not to — BOT_CROSSING_NO_OPEN is about incidental opens, not this one.
+  open "$URL" >/dev/null 2>&1 || true
+  echo "Opened $URL"
+}
+
+cmd_restart() {
+  cmd_stop || true
+  cmd_start "$@"
+}
+
+cmd_logs() {
+  : >>"$LOGFILE"
+  tail -n 50 -f "$LOGFILE"
+}
+
+cmd_build() {
+  pick_node
+  ensure_deps
+  run_build
+}
+
+APP_PATH="$ROOT/Bot Crossing.app"
+
+cmd_install_app() {
+  # osacompile turns a one-line AppleScript into a real, double-clickable .app. `do shell
+  # script` runs it without opening a Terminal window, which is the whole point: the Dock
+  # icon should behave like an app, not like a script.
+  # Two layers of quoting, in this order:
+  #  1. shell — wrap the path in single quotes so spaces survive (this repo lives under
+  #     "Claude Code"), turning any embedded quote into the usual '\'' dance;
+  #  2. AppleScript — the result is pasted inside a double-quoted AppleScript string, so
+  #     backslashes and double quotes have to be escaped again for the compiler.
+  local sq="'" sq_esc="'\\''" shell_cmd apple_cmd
+  shell_cmd="'${SELF_PATH//$sq/$sq_esc}' toggle"
+  apple_cmd="${shell_cmd//\\/\\\\}"
+  apple_cmd="${apple_cmd//\"/\\\"}"
+
+  rm -rf "$APP_PATH"
+  osacompile -o "$APP_PATH" -e "do shell script \"$apple_cmd\""
+  echo "Created: $APP_PATH"
+  echo
+  echo "Drag \"Bot Crossing.app\" from the Finder onto your Dock."
+  echo "Click once to build (if needed), start the server and open $URL."
+  echo "Click again to stop it — nothing runs in between."
+  echo
+  echo "Open the folder now with:  open \"$ROOT\""
+}
+
+cmd_uninstall_app() {
+  if [ -d "$APP_PATH" ]; then
+    rm -rf "$APP_PATH"
+    echo "Removed: $APP_PATH"
+    echo "If you dragged it to the Dock, remove the leftover icon there too."
+  else
+    echo "Nothing to remove — no app at $APP_PATH"
+  fi
+}
+
+usage() {
+  cat <<USAGE
+Bot Crossing — local launcher
+
+Usage: bot-crossing <command>
+
+  start [--no-open]  Build if needed, start the server, open the browser
+  stop               Stop the server and leave nothing running
+  toggle             Stop if running, otherwise start (with a notification)
+  open               Start if needed, then open $URL
+  restart            Stop, then start
+  status             Say whether it is running (exit 0 running, 1 not)
+  logs               Follow $LOGFILE
+  build              Force a production build
+  install-app        Create "Bot Crossing.app" for the Dock (a toggle button)
+  uninstall-app      Delete that app
+  help               This text
+
+Environment:
+  PORT                  Port to serve on (default 5274)
+  BOT_CROSSING_HOST     Address to bind (default 127.0.0.1)
+  BOT_CROSSING_NO_OPEN  Set to 1 to never open a browser
+USAGE
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd="${1:-help}"
+  if [ $# -gt 0 ]; then shift; fi
+  case "$cmd" in
+    start) cmd_start "$@" ;;
+    stop) cmd_stop ;;
+    status) cmd_status ;;
+    toggle) cmd_toggle "$@" ;;
+    open) cmd_open ;;
+    restart) cmd_restart "$@" ;;
+    logs) cmd_logs ;;
+    build) cmd_build ;;
+    install-app) cmd_install_app ;;
+    uninstall-app) cmd_uninstall_app ;;
+    help | -h | --help) usage ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      echo >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
