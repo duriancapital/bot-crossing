@@ -155,6 +155,11 @@ thread can only ever be doing one thing. First match wins:
 Only the states that want something from you get a badge. With most of a real thread list
 sitting quiet, a symbol over every astronaut buries the one `?` that actually matters.
 
+A thread whose transcript Claude Code has since deleted — it keeps them for `cleanupPeriodDays`,
+thirty by default, while the desktop app keeps its record of the thread forever — never asks for
+you: there is nothing left to read, and Open would only reach "Session not found on disk". Its
+card says **Transcript gone** instead.
+
 Zone names follow the same rule: a plot shows its name only while somebody there is working,
 waiting or stuck. Everything else is nameless until you point at it. The plate itself is just
 text over a soft halo with a small accent dot — no panel, no outline.

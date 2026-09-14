@@ -71,12 +71,21 @@ function windowsDataDir() {
   return candidates.find((dir) => existsSync(path.join(dir, 'claude-code-sessions'))) || roaming
 }
 
+/**
+ * Both store roots take an env override, the way `CODEX_HOME` and `BOT_CROSSING_CURSOR_PROJECTS`
+ * do for their adapters: unset, this is exactly where the app and the CLI actually keep things,
+ * and the Windows/Linux resolution above still decides the desktop side. Set, a test can stand a
+ * whole Claude install up in a temp directory and get the same answers on any machine.
+ */
 /** Where the Claude desktop app keeps one JSON record per thread. */
-const DESKTOP_SESSIONS = path.join(desktopDataDir(), 'claude-code-sessions')
+const DESKTOP_SESSIONS =
+  process.env.BOT_CROSSING_CLAUDE_DESKTOP || path.join(desktopDataDir(), 'claude-code-sessions')
+/** The CLI's own root; both of its stores hang off it. */
+const CLAUDE_DIR = process.env.BOT_CROSSING_CLAUDE_DIR || path.join(HOME, '.claude')
 /** Where the CLI keeps the raw transcript: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl */
-const CLI_PROJECTS = path.join(HOME, '.claude', 'projects')
+const CLI_PROJECTS = path.join(CLAUDE_DIR, 'projects')
 /** One file per live CLI process: {pid, sessionId, cwd, ...}. Stale files outlive their pid. */
-const CLI_LIVE = path.join(HOME, '.claude', 'sessions')
+const CLI_LIVE = path.join(CLAUDE_DIR, 'sessions')
 
 const HEAD_BYTES = 192 * 1024
 
@@ -476,6 +485,26 @@ async function scanThreads() {
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen
     // it — the only way a terminal-only thread can ask for anything at all.
     if (waiting) thread.unread = true
+
+    // The last word on `unread`, because the two stores expire on different clocks.
+    //
+    // The CLI deletes transcripts under `~/.claude/projects` once they pass `cleanupPeriodDays`
+    // (30 by default); the desktop app keeps its per-thread record forever. So a thread you
+    // stopped reading two months ago still has a record saying it moved on after you last looked
+    // — `recordActivityAt > lastFocusedAt` — with nothing left behind it. That is most of the
+    // colony's `?` badges on an old machine, and Open sends the app to a thread it no longer has,
+    // which answers "Session not found on disk". A thread that cannot be read cannot be unread.
+    //
+    // Only records from the desktop app can be in this state: a transcript-sourced thread has its
+    // transcript by definition. The grace period is the same one the filter above uses, and for
+    // the same reason — a session opened a minute ago has not written its transcript yet, and is
+    // missing nothing. A live process says the same thing more loudly.
+    thread.transcriptMissing =
+      thread.desktopSessionIds.length > 0 &&
+      !thread.hasTranscript &&
+      !thread.hasLiveProcess &&
+      now - (thread.lastActivityAt || thread.createdAt || 0) >= NEW_SESSION_MS
+    if (thread.transcriptMissing) thread.unread = false
   }
   return threads.map(toThread)
 }

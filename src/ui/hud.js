@@ -594,6 +594,9 @@ export class Hud {
     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
     if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
+    // Says why an old thread has no `?` and will not open: the harness kept the record, not the
+    // conversation. Without it the card just looks inexplicably empty.
+    if (thread.transcriptMissing) bits.push(`<span class="tag">${escapeHtml('Transcript gone')}</span>`)
     bits.push(`<span>${ago(thread.lastActivityAt)}</span>`)
     meta.innerHTML = bits.join('')
 

@@ -241,3 +241,88 @@ test('Cursor offers a folder link but never a per-thread one it cannot honour', 
   assert.equal(h.newSession('relative/path').ok, false)
   await fsp.rm(home, { recursive: true, force: true })
 })
+
+// ── Claude Code, faked on disk ────────────────────────────────────────────────
+
+const DESKTOP_ID = `local_${SESSION_ID}`
+
+/**
+ * A whole Claude install in a temp directory: the desktop app's record of one thread, and the
+ * CLI transcript it points at only when `withTranscript` says so. That split is the thing worth
+ * testing — the CLI deletes transcripts after 30 days, the app keeps its record forever, so the
+ * two stores disagree about every thread older than a month.
+ *
+ * `lastFocusedAt` sits behind `lastActivityAt`, which is what the app's own bookkeeping calls
+ * unread: the thread moved on after you last looked at it.
+ */
+async function fakeClaude({ ageMs, withTranscript }) {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-fixture-'))
+  const org = path.join(root, 'desktop', 'acct', 'org')
+  await fsp.mkdir(org, { recursive: true })
+  const at = Date.now() - ageMs
+  const record = {
+    sessionId: DESKTOP_ID,
+    cliSessionId: SESSION_ID,
+    title: 'Ship the colony',
+    cwd: '/tmp/demo',
+    createdAt: at,
+    lastActivityAt: at,
+    lastFocusedAt: at - 60 * 1000,
+  }
+  await fsp.writeFile(path.join(org, `${DESKTOP_ID}.json`), JSON.stringify(record))
+  if (withTranscript) {
+    const project = path.join(root, 'claude', 'projects', '-tmp-demo')
+    await fsp.mkdir(project, { recursive: true })
+    const lines = [
+      { type: 'user', message: { content: 'hi' }, cwd: '/tmp/demo', timestamp: '2026-06-01T00:00:00.000Z' },
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'hello' }] },
+        cwd: '/tmp/demo',
+        timestamp: '2026-06-01T00:00:01.000Z',
+      },
+    ]
+    await fsp.writeFile(path.join(project, `${SESSION_ID}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n')
+  }
+  return root
+}
+
+async function claudeWith(root) {
+  process.env.BOT_CROSSING_CLAUDE_DESKTOP = path.join(root, 'desktop')
+  process.env.BOT_CROSSING_CLAUDE_DIR = path.join(root, 'claude')
+  const mod = await import(`../server/harnesses/claude-code.mjs?${root}`)
+  return mod.default
+}
+
+test('a desktop record whose transcript has been cleaned up stops asking for attention', async () => {
+  const root = await fakeClaude({ ageMs: 90 * 24 * 60 * 60 * 1000, withTranscript: false })
+  const h = await claudeWith(root)
+  assert.equal(await h.detect(), true)
+  const [t] = await h.scanThreads()
+  assert.equal(t.id, `claude-code:${SESSION_ID}`)
+  assert.equal(t.hasTranscript, false)
+  // The record still says "moved on since you last looked", and on its own that is a `?` badge
+  // over a thread the app can no longer open.
+  assert.equal(t.transcriptMissing, true, 'the optional field survives toThread()')
+  assert.equal(t.unread, false, 'a thread that cannot be read cannot be unread')
+  await fsp.rm(root, { recursive: true, force: true })
+})
+
+test('the same record with its transcript still on disk is unread as before', async () => {
+  const root = await fakeClaude({ ageMs: 90 * 24 * 60 * 60 * 1000, withTranscript: true })
+  const h = await claudeWith(root)
+  const [t] = await h.scanThreads()
+  assert.equal(t.hasTranscript, true)
+  assert.equal(t.transcriptMissing, false)
+  assert.equal(t.unread, true, 'nothing about a thread with a transcript changes')
+  await fsp.rm(root, { recursive: true, force: true })
+})
+
+test('a session opened seconds ago is not missing a transcript it has not written yet', async () => {
+  const root = await fakeClaude({ ageMs: 5 * 1000, withTranscript: false })
+  const h = await claudeWith(root)
+  const [t] = await h.scanThreads()
+  assert.equal(t.transcriptMissing, false, 'inside the new-session grace period')
+  assert.equal(t.unread, true, 'and the record still decides')
+  await fsp.rm(root, { recursive: true, force: true })
+})

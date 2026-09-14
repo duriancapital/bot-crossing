@@ -90,6 +90,7 @@ what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map
 | `lastFocusedAt` | number | Epoch ms, `0` if unknowable |
 | `running` | boolean | Working **right now** — the astronaut hammers away |
 | `unread` | boolean | Moved on since you last looked — the astronaut stops and holds a `?` |
+| `transcriptMissing` | boolean | Optional. The harness has a record of this thread but its transcript is gone, so it can neither be read nor reopened — never `unread` |
 | `hasError` | boolean | Errored — the astronaut slumps, red eyes |
 | `starred` / `routine` / `prState` | | Optional extras; `prState: 'merged'` triggers the confetti |
 | `archived` | boolean | Archived in the harness's own records. Read-only — reporting it is all an adapter does |
