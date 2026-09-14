@@ -522,6 +522,14 @@ adjustable. A dot next to a setting means you have moved it away from its preset
 
 The knobs that actually matter, and why:
 
+- **Frame rate** is the lever on a fast machine, where the governor below never fires because
+  nothing is ever slow. Without a cap the loop runs at the display's refresh — 120 Hz on a
+  ProMotion panel — drawing every pixel of a retina screen through bloom and depth of field a
+  hundred and twenty times a second for a scene that is meant to be glanced at, which is how a
+  colony on a second monitor turns a laptop's fans on. The default is **30**, with 24, 60 and the
+  display's own rate a click away. **When idle** — 45 seconds without pointer, wheel or key
+  input, or whenever the window is not focused — it drops to **12** (6, 20 or the same as above).
+  A refused frame does nothing at all, so the saving is real; a hidden tab was already free.
 - **Render scale** is the biggest lever there is. The drawing buffer is sized directly rather
   than through `setPixelRatio`, which cannot usefully go below 1 on a retina panel. It is a
   share of *your display's own resolution*, so 100% is native on a retina panel and native on
