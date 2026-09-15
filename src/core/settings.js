@@ -188,6 +188,11 @@ export class Settings {
     this.values = { ...DEFAULTS, ...load() }
     this.listeners = new Set()
     this._saveTimer = 0
+    /**
+     * Keys the URL took over for this page view, each holding the value that *would* have
+     * been in use without it. See `applySession` — this is the whole of the mechanism.
+     */
+    this._session = {}
   }
 
   get(key) {
@@ -228,21 +233,23 @@ export class Settings {
     return () => this.listeners.delete(fn)
   }
 
-  _emit(keys) {
+  _emit(keys, session = false) {
     const changed = new Set(keys)
     const scope = {
       world: keys.some((k) => WORLD_KEYS.has(k)),
       render: keys.some((k) => RENDER_KEYS.has(k)),
+      /** True when this change came from the URL and must not be written anywhere. */
+      session,
     }
     for (const fn of this.listeners) fn(changed, scope, this.values)
-    this._scheduleSave()
+    if (!session) this._scheduleSave()
   }
 
   _scheduleSave() {
     clearTimeout(this._saveTimer)
     this._saveTimer = setTimeout(() => {
       try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(this.values))
+        localStorage.setItem(STORE_KEY, JSON.stringify(this.saveValues))
       } catch {
         /* private mode, quota — the game just forgets between sessions */
       }
@@ -257,12 +264,58 @@ export class Settings {
   applyAll(values) {
     const changed = []
     for (const [key, value] of Object.entries(values || {})) {
-      if (!(key in this.values) || this.values[key] === value) continue
+      if (!(key in this.values)) continue
+      // A key the URL claimed keeps the URL's answer on screen, but still records the file's
+      // — so the colony file's own taste survives being looked at through a wallpaper.
+      if (key in this._session) {
+        this._session[key] = value
+        continue
+      }
+      if (this.values[key] === value) continue
       this.values[key] = value
       changed.push(key)
     }
     if (changed.length) this._emit(changed)
     return changed.length
+  }
+
+  /**
+   * Adopt values for this page view only. They take effect exactly like any other change —
+   * the renderer reconfigures, the world rebuilds — but they are never written back.
+   *
+   * WHY: one server, two very different windows. The colony is opened in an ordinary browser
+   * tab *and*, on a side monitor, as a desktop wallpaper whose URL says what that screen
+   * should be: low preset, six frames a second, no panels. Settings are shared between the
+   * two — localStorage per origin, and the colony file's `settings` block across origins —
+   * so if the wallpaper's choices were saved they would become the browser's, and the next
+   * tab you opened by hand would come up dark, crawling and stripped of its HUD, with nothing
+   * on screen to explain why. So the value each key had *before* the URL touched it is kept
+   * here, and that is what every later save writes: the wallpaper borrows the settings, it
+   * does not get to keep them.
+   *
+   * `preset` is expanded rather than stored as a name, since a preset is its values.
+   */
+  applySession(values) {
+    const incoming = { ...(values || {}) }
+    const preset = PRESETS[incoming.preset]
+    if (preset) Object.assign(incoming, preset.values)
+    else delete incoming.preset
+    const changed = []
+    for (const [key, value] of Object.entries(incoming)) {
+      if (!(key in this.values)) continue
+      // Once per key, and before the write: the first reading is the one worth keeping.
+      if (!(key in this._session)) this._session[key] = this.values[key]
+      if (this.values[key] === value) continue
+      this.values[key] = value
+      changed.push(key)
+    }
+    if (changed.length) this._emit(changed, true)
+    return changed.length
+  }
+
+  /** The settings as they should be *stored*: live values with any URL override wound back. */
+  get saveValues() {
+    return { ...this.values, ...this._session }
   }
 
   // Convenience readers used all over the render code.

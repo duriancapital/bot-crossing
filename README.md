@@ -59,6 +59,23 @@ stranger on the port is reported and left alone.
 For a Dock button, `bin/bot-crossing install-app` compiles a tiny "Bot Crossing.app" (gitignored)
 whose one action is `toggle`: click to start and open, click again to stop.
 
+### On a side monitor
+
+The page can also be a **live wallpaper**: the colony drawn behind your windows on a screen of
+your choosing, in front when nothing is open there. A wallpaper has no keyboard and no pointer to
+set anything up with, so its whole configuration arrives in the URL:
+
+```
+http://127.0.0.1:5274/?wallpaper&preset=low&fps=24&idle=6
+```
+
+`wallpaper` hides every panel (as `H` does), turns orbit mode on, never shows the welcome sheet,
+and pins the frame gate to the idle rate from the first frame. `preset`, `fps`, `idle`,
+`planet`, `time` (`live`, or 0–1 for a fixed hour), `orbit` and `hud` can each be set on
+their own. Everything a URL sets is for **that page view only**: it never reaches the browser's
+stored settings or the colony file, so opening the colony in a normal tab afterwards still comes
+up the way you left it.
+
 ## Which harnesses work
 
 A **harness** is whatever actually runs your threads. Bot Crossing reads each one's local

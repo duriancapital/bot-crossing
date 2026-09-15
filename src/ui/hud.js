@@ -61,6 +61,12 @@ export class Hud {
     this.visible = true
     this._last = {}
     this.hiddenOpen = false
+    /**
+     * Swallow hints and toasts. Set for the wallpaper view: hiding the panels there and then
+     * still flashing "Orbit mode on" over the desktop would be the one bit of chrome nobody
+     * can dismiss — there is no pointer and no keyboard behind a desktop background.
+     */
+    this.quiet = false
 
     this.el = document.createElement('div')
     this.el.className = 'hud'
@@ -760,6 +766,7 @@ export class Hud {
   }
 
   hint(text, ms = 3200) {
+    if (this.quiet) return
     const el = this.$('.hint-pill')
     el.textContent = text
     el.classList.add('on')
@@ -768,6 +775,7 @@ export class Hud {
   }
 
   toast(message, kind = '') {
+    if (this.quiet) return
     const el = document.createElement('div')
     el.className = `toast panel ${kind}`
     el.textContent = message

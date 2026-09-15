@@ -132,3 +132,17 @@ test('a settled rate change keeps its new number exactly', () => {
   gate.setRate(60)
   assert.equal(run(gate, 1000, { from: 1000 }), 60)
 })
+
+// ── unattended ────────────────────────────────────────────────────────────────
+
+test('an unattended gate ignores focus and activity for good', () => {
+  const gate = new FrameGate({ rate: 60, idleRate: 6, now: 0 })
+  gate.setUnattended()
+  // Both of the things that normally wake it, and neither one lands: a wallpaper's web view
+  // reporting focus, and a mouse crossing that monitor on its way somewhere else.
+  gate.setFocused(true)
+  gate.noteActivity(1000)
+  assert.equal(gate.isIdle(1000), true)
+  assert.equal(gate.rateAt(1000), 6)
+  assert.equal(run(gate, 1000), 6)
+})

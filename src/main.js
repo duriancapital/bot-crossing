@@ -2,6 +2,7 @@ import * as THREE from 'three'
 import './ui/styles.css'
 import { DEFAULT_PRESET, Settings, hasStoredSettings } from './core/settings.js'
 import { Engine } from './core/engine.js'
+import { parseQuery } from './core/query.js'
 import { CameraRig } from './core/camera.js'
 import { Colony, STATUS_LABEL, STATUS_ORDER, statusFor, transcriptProgress } from './game/colony.js'
 import { Hud } from './ui/hud.js'
@@ -40,10 +41,25 @@ app.insertAdjacentHTML(
    </div></div>`
 )
 
+/**
+ * What this particular window was asked to be. The page is also run as a desktop wallpaper —
+ * Plash renders a URL behind the desktop on a screen of your choosing — and that view has no
+ * keyboard and no pointer to set anything up with, so its whole configuration arrives in the
+ * URL. Read before anything else exists, since it decides how the first frame is drawn.
+ */
+const view = parseQuery(location.search, Object.keys(PLANETS))
+
 const settings = new Settings()
 if (!hasStoredSettings()) settings.applyPreset(DEFAULT_PRESET)
+// Applied here rather than after the colony file comes back so the very first frame is
+// already the one asked for. `applySession` keeps them out of localStorage and out of the
+// file, and `applyAll` below knows not to overwrite them — see settings.js for why.
+settings.applySession(view.settings)
 
 const engine = new Engine(settings).mount(app)
+// Nobody is sitting in front of a wallpaper, and Plash's web view cannot be trusted to say
+// so, so the frame gate is told outright: idle rate from the first frame, forever.
+if (view.wallpaper) engine.gate.setUnattended()
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
@@ -276,6 +292,14 @@ const hud = new Hud(app, settings, actions)
 const sideWidth = () => (window.innerWidth <= 820 ? 0 : 334)
 hud.setSideWidth(sideWidth())
 window.addEventListener('resize', () => hud.setSideWidth(sideWidth()))
+
+// The unattended view, set up the way a person would set it up by hand — `toggleUi(false)` is
+// exactly what H does, so there is one definition of "everything away" rather than two. The
+// shortcuts themselves stay registered: Plash can switch a wallpaper into browsing mode, and
+// then the keyboard should work like it does anywhere else.
+if (view.wallpaper) hud.quiet = true
+if (view.hud !== undefined) hud.toggleUi(view.hud)
+if (view.orbit !== undefined) hud.setOrbit(rig.setOrbit(view.orbit))
 
 // ── selection ─────────────────────────────────────────────────────────────────────────
 
@@ -716,6 +740,12 @@ async function boot() {
     if (!document.hidden) poll()
   })
 
+  // A wallpaper gets neither half of the welcome. The sheet would sit open over the desktop
+  // with nobody able to close it, and — worse — writing the flag would burn the real first
+  // run: open the colony in a browser afterwards and it would act like you had already been
+  // shown the controls, on a screen where you never could have read them.
+  if (view.wallpaper) return
+
   if (!localStorage.getItem('botcrossing.seen-help')) {
     hud.toggleHelp(true)
     localStorage.setItem('botcrossing.seen-help', '1')
@@ -730,8 +760,14 @@ settings.onChange((changed, scope) => {
   // Kept in the colony file as well as in this browser's own storage. `localStorage` is
   // per *origin*, so a dev server that comes back on a different port looks to the browser
   // like a different site and hands you factory settings — the file does not care.
-  state.settings = { ...settings.values }
-  queueSave()
+  //
+  // `saveValues` rather than `values`, and nothing at all for a change the URL made: the
+  // wallpaper's preset and frame rate belong to that one screen, and the file is the one
+  // place they could leak from it into every other window. See `Settings#applySession`.
+  if (!scope.session) {
+    state.settings = { ...settings.saveValues }
+    queueSave()
+  }
   if (scope.render || changed.has('fov')) engine.applySettings()
   colony.onSettingsChanged(changed, scope)
   if (changed.has('showFps')) hud.syncSettings()

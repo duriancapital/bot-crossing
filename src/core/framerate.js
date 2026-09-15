@@ -54,6 +54,21 @@ export class FrameGate {
     /** When the next frame is *due*. Advanced by whole intervals, never by "now + interval". */
     this._nextAt = now
     this._interval = null
+    /** See `setUnattended`: a screen nobody is sitting at, whatever the window system says. */
+    this._unattended = false
+  }
+
+  /**
+   * Pin the gate to its idle rate for good.
+   *
+   * A wallpaper view is never being *looked at* in the sense this class means, and it cannot
+   * be trusted to say so itself: the web view behind the desktop may well report focus, and
+   * a mouse crossing that monitor on its way somewhere else is not somebody using the colony.
+   * So the wallpaper declares it once at boot instead, and focus stops being an input.
+   */
+  setUnattended(on = true) {
+    this._unattended = Boolean(on)
+    if (this._unattended) this._focused = false
   }
 
   setRate(fps) {
@@ -65,6 +80,7 @@ export class FrameGate {
   }
 
   setFocused(focused) {
+    if (this._unattended) return
     this._focused = Boolean(focused)
   }
 
