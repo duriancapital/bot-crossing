@@ -12,6 +12,10 @@ data/*.pid
 # "Bot Crossing.app" — the Dock launcher built locally by `bin/bot-crossing install-app`.
 *.app
 
+# The compiled wallpaper. wallpaper/BotCrossingWallpaper.swift is the checked-in article; this
+# is whatever `bin/bot-crossing wallpaper build` made of it on this particular machine.
+wallpaper/build/
+
 # Per-machine Claude Code permissions — personal paths live in here.
 .claude/settings.local.json
 

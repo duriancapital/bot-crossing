@@ -48,6 +48,21 @@ LOGFILE="$DATA_DIR/server.log"
 URL="http://127.0.0.1:$PORT/"
 SERVER_ENTRY="server/serve.mjs"
 
+# The wallpaper: one Swift file, compiled locally into a minimal .app bundle. Same bargain as
+# the server — a pidfile, a log, and nothing left behind when it is stopped.
+WP_DIR="$ROOT/wallpaper"
+WP_SOURCE="$WP_DIR/BotCrossingWallpaper.swift"
+WP_BUILD="$WP_DIR/build"
+WP_APP="$WP_BUILD/Bot Crossing Wallpaper.app"
+WP_EXE_NAME="Bot Crossing Wallpaper"
+WP_EXE="$WP_APP/Contents/MacOS/$WP_EXE_NAME"
+WP_PIDFILE="$DATA_DIR/wallpaper.pid"
+WP_LOGFILE="$DATA_DIR/wallpaper.log"
+# What the page is told it is. `?wallpaper` turns the HUD off and the colony on; preset=low and
+# idle=6 keep a screen nobody is looking at from spending a GPU on it. Harmless if the build
+# in dist/ does not know these parameters yet — unknown query keys are simply ignored.
+WP_URL_DEFAULT="${URL}?wallpaper&preset=low&idle=6"
+
 # data/ holds the colony state, the pidfile and the log. It is gitignored, and it may not
 # exist on a fresh clone, so create it before anything tries to write there.
 mkdir -p "$DATA_DIR"
@@ -137,10 +152,13 @@ pid_is_server() {
   esac
 }
 
+# read_pid [FILE] — the PID recorded in FILE (the server's pidfile by default), or nothing at
+# all if the file is missing, empty or does not hold a plain number.
 read_pid() {
-  [ -f "$PIDFILE" ] || return 1
+  local file="${1:-$PIDFILE}"
+  [ -f "$file" ] || return 1
   local pid
-  pid="$(tr -d '[:space:]' <"$PIDFILE" 2>/dev/null || true)"
+  pid="$(tr -d '[:space:]' <"$file" 2>/dev/null || true)"
   [ -n "$pid" ] || return 1
   case "$pid" in
     *[!0-9]*) return 1 ;;
@@ -286,6 +304,14 @@ cmd_start() {
 cmd_stop() {
   local stopped=0 pid
 
+  # The wallpaper is a window onto this server and nothing else. Taking the server away first
+  # would leave a black rectangle on somebody's monitor quietly retrying every thirty seconds, so
+  # it goes first — and `stop` still means what it says: nothing of ours left running.
+  if wp_is_running; then
+    printf 'wallpaper: '
+    cmd_wallpaper_stop
+  fi
+
   pid="$(read_pid || true)"
   if [ -n "$pid" ] && pid_alive "$pid" && pid_is_server "$pid"; then
     kill -TERM "$pid" 2>/dev/null || true
@@ -358,6 +384,7 @@ cmd_status() {
     echo "  port: $PORT"
     echo "  url:  $URL"
     echo "  log:  $LOGFILE"
+    wallpaper_status_line
     return 0
   fi
   echo "Bot Crossing: not running"
@@ -369,6 +396,7 @@ cmd_status() {
   echo "  port: $PORT"
   echo "  url:  $URL"
   echo "  log:  $LOGFILE"
+  wallpaper_status_line
   return 1
 }
 
@@ -406,6 +434,270 @@ cmd_build() {
   pick_node
   ensure_deps
   run_build
+}
+
+# ---------------------------------------------------------------------------
+# Wallpaper
+# ---------------------------------------------------------------------------
+
+# pid_is_wallpaper PID — the same rule as pid_is_server, for the wallpaper's own binary: a
+# pidfile that outlived a reboot must never be allowed to kill a stranger.
+pid_is_wallpaper() {
+  local pid="${1:-}" cmd
+  [ -n "$pid" ] || return 1
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+  case "$cmd" in
+    *"$WP_EXE_NAME"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# wp_is_running — a recorded process that is alive and really is ours. There is no port to probe
+# here (the wallpaper listens to nothing), so the command line is the whole check.
+wp_is_running() {
+  local pid
+  pid="$(read_pid "$WP_PIDFILE" || true)"
+  [ -n "$pid" ] || return 1
+  pid_alive "$pid" || return 1
+  pid_is_wallpaper "$pid" || return 1
+  return 0
+}
+
+# wp_needs_build — the binary is missing or older than the source. Same bargain as needs_build
+# above: swiftc costs a few seconds and the usual answer is that nothing changed.
+wp_needs_build() {
+  [ -f "$WP_EXE" ] || return 0
+  [ "$WP_SOURCE" -nt "$WP_EXE" ]
+}
+
+cmd_wallpaper_build() {
+  if [ ! -f "$WP_SOURCE" ]; then
+    echo "wallpaper: missing $WP_SOURCE" >&2
+    return 1
+  fi
+  if ! command -v swiftc >/dev/null 2>&1; then
+    echo "wallpaper: no swiftc on PATH — install Apple's Command Line Tools with" >&2
+    echo "           xcode-select --install" >&2
+    return 1
+  fi
+
+  echo "Building the wallpaper…"
+  # Rebuild the bundle rather than write into the old one: a half-replaced .app whose signature
+  # no longer matches its binary is refused by the system with a message nobody can read.
+  rm -rf "$WP_APP"
+  mkdir -p "$WP_APP/Contents/MacOS"
+
+  # -parse-as-library because a single .swift file is otherwise compiled in script mode, where
+  # @main is an error; -swift-version 5 because Swift 6's strict concurrency has opinions about
+  # AppKit callbacks that would cost more ceremony than the file is worth. Both are explained at
+  # the top of the source.
+  swiftc -O -swift-version 5 -parse-as-library \
+    -framework Cocoa -framework WebKit \
+    -o "$WP_EXE" "$WP_SOURCE"
+
+  # LSUIElement matches the .accessory activation policy the app sets at runtime: no Dock tile,
+  # no menu bar. NSAllowsLocalNetworking is the one that actually matters — without it App
+  # Transport Security refuses plain http:// inside WKWebView, and the wallpaper would sit black
+  # forever in front of a server that was answering perfectly well.
+  cat >"$WP_APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>com.botcrossing.wallpaper</string>
+  <key>CFBundleName</key><string>Bot Crossing Wallpaper</string>
+  <key>CFBundleExecutable</key><string>Bot Crossing Wallpaper</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key><true/>
+  </dict>
+</dict>
+</plist>
+PLIST
+
+  # Ad-hoc ("-"), and that is enough on purpose. This bundle is built on the machine it runs on
+  # and is never distributed, so a Developer ID would buy nothing: what the signature is for here
+  # is that Apple Silicon refuses to run an unsigned binary at all, and that the signature covers
+  # Info.plist — which we just wrote, invalidating the one swiftc applied on its own.
+  if ! codesign --force --sign - "$WP_APP" 2>/dev/null; then
+    echo "wallpaper: codesign failed — the app will probably refuse to launch" >&2
+    return 1
+  fi
+
+  echo "Built: $WP_APP"
+}
+
+ensure_wp_build() {
+  if wp_needs_build; then
+    cmd_wallpaper_build
+  fi
+}
+
+cmd_wallpaper_start() {
+  local display="" url="" interactive=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --display)
+        [ $# -ge 2 ] || { echo "wallpaper start: --display needs a value" >&2; return 2; }
+        display="$2"
+        shift
+        ;;
+      --url)
+        [ $# -ge 2 ] || { echo "wallpaper start: --url needs a value" >&2; return 2; }
+        url="$2"
+        shift
+        ;;
+      --interactive) interactive=1 ;;
+      *) echo "wallpaper start: unknown option '$1'" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  if wp_is_running; then
+    echo "Wallpaper already running (pid $(read_pid "$WP_PIDFILE"), log $WP_LOGFILE)"
+    return 0
+  fi
+
+  # A pidfile can survive a crash or a reboot; clear it before starting so `status` never reports
+  # a PID belonging to nothing.
+  rm -f "$WP_PIDFILE"
+
+  # The page is nothing without the server, so bring that up first — with --no-open, because a
+  # wallpaper has no business throwing a browser window at you.
+  if ! is_running; then
+    cmd_start --no-open
+  fi
+
+  ensure_wp_build
+
+  [ -n "$url" ] || url="$WP_URL_DEFAULT"
+  local args
+  args=(--url "$url" --log "$WP_LOGFILE")
+  if [ -n "$display" ]; then args+=(--display "$display"); fi
+  if [ "$interactive" -eq 1 ]; then args+=(--interactive); fi
+
+  # Detached exactly like the server: nohup, all three streams redirected, disown. The bundle's
+  # binary is run directly rather than through `open` — `open` hands the app to launchd and
+  # returns, and we would never learn the PID we are expected to be able to stop. Launching the
+  # executable inside the bundle still gets us the bundle: the Info.plist next to it is what
+  # LSUIElement and the ATS exception are read from.
+  nohup "$WP_EXE" "${args[@]}" >>"$WP_LOGFILE" 2>&1 </dev/null &
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+  printf '%s\n' "$pid" >"$WP_PIDFILE"
+
+  # There is no port to poll, so all we can confirm is that it did not fall over immediately —
+  # which is what a missing framework or a refused signature looks like.
+  local waited=0
+  while [ "$waited" -lt 4 ]; do
+    if ! pid_alive "$pid"; then
+      rm -f "$WP_PIDFILE"
+      echo "Wallpaper failed to start — last lines of $WP_LOGFILE:" >&2
+      tail -n 20 "$WP_LOGFILE" >&2 || true
+      return 1
+    fi
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+
+  echo "Wallpaper running on ${display:-secondary} → $url (pid $pid, log $WP_LOGFILE)"
+  notify "Wallpaper running on ${display:-secondary}"
+}
+
+cmd_wallpaper_stop() {
+  local pid stopped=0
+
+  pid="$(read_pid "$WP_PIDFILE" || true)"
+  if [ -n "$pid" ] && pid_alive "$pid"; then
+    # Same rule as the server's stop: only ever signal a process whose command line says it is
+    # ours. Unlike the server there is no port to sweep afterwards, so there is no second chance
+    # here — and hunting the whole process table for a likely-looking stray is exactly the
+    # guessing this rule exists to prevent.
+    if pid_is_wallpaper "$pid"; then
+      kill -TERM "$pid" 2>/dev/null || true
+      local waited=0
+      while [ "$waited" -lt 12 ] && pid_alive "$pid"; do
+        sleep 0.25
+        waited=$((waited + 1))
+      done
+      if pid_alive "$pid"; then
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 0.25
+      fi
+      stopped=1
+    else
+      echo "note: pid $pid in $WP_PIDFILE is not the wallpaper — left alone" >&2
+    fi
+  fi
+  rm -f "$WP_PIDFILE"
+
+  if [ "$stopped" -eq 1 ]; then
+    echo "stopped"
+  else
+    echo "was not running"
+  fi
+  return 0
+}
+
+cmd_wallpaper_status() {
+  local pid
+  pid="$(read_pid "$WP_PIDFILE" || true)"
+  if wp_is_running; then
+    echo "Bot Crossing wallpaper: running"
+    echo "  pid:  $pid"
+    echo "  app:  $WP_APP"
+    echo "  log:  $WP_LOGFILE"
+    return 0
+  fi
+  echo "Bot Crossing wallpaper: not running"
+  if [ -n "$pid" ]; then
+    echo "  pid:  $pid (stale pidfile — process gone)"
+  else
+    echo "  pid:  —"
+  fi
+  if [ -f "$WP_EXE" ]; then
+    echo "  app:  $WP_APP"
+  else
+    echo "  app:  not built yet (bot-crossing wallpaper build)"
+  fi
+  echo "  log:  $WP_LOGFILE"
+  return 1
+}
+
+# One line for the end of the plain `status`; the full picture is in `wallpaper status`.
+wallpaper_status_line() {
+  local pid
+  pid="$(read_pid "$WP_PIDFILE" || true)"
+  if wp_is_running; then
+    echo "  wallpaper: running (pid $pid, log $WP_LOGFILE)"
+  else
+    echo "  wallpaper: not running"
+  fi
+}
+
+cmd_wallpaper() {
+  local sub="${1:-status}"
+  if [ $# -gt 0 ]; then shift; fi
+  case "$sub" in
+    build) cmd_wallpaper_build ;;
+    start) cmd_wallpaper_start "$@" ;;
+    stop) cmd_wallpaper_stop ;;
+    status) cmd_wallpaper_status ;;
+    help | -h | --help)
+      echo "wallpaper build | start [--display X] [--url U] [--interactive] | stop | status"
+      ;;
+    *)
+      echo "wallpaper: unknown subcommand '$sub' (build, start, stop, status)" >&2
+      return 2
+      ;;
+  esac
 }
 
 APP_PATH="$ROOT/Bot Crossing.app"
@@ -452,7 +744,7 @@ Bot Crossing — local launcher
 Usage: bot-crossing <command>
 
   start [--no-open]  Build if needed, start the server, open the browser
-  stop               Stop the server and leave nothing running
+  stop               Stop the wallpaper and the server; leave nothing running
   toggle             Stop if running, otherwise start (with a notification)
   open               Start if needed, then open $URL
   restart            Stop, then start
@@ -461,7 +753,21 @@ Usage: bot-crossing <command>
   build              Force a production build
   install-app        Create "Bot Crossing.app" for the Dock (a toggle button)
   uninstall-app      Delete that app
+  wallpaper <sub>    Live desktop wallpaper (see below)
   help               This text
+
+Wallpaper — the colony behind your windows, on one display:
+
+  wallpaper build    Compile wallpaper/BotCrossingWallpaper.swift into
+                     "wallpaper/build/Bot Crossing Wallpaper.app"
+  wallpaper start [--display X] [--url U] [--interactive]
+                     Start the server if needed, build if needed, then show it.
+                     --display main | secondary | index N | part of a screen's
+                     name (default secondary, falling back to main when that is
+                     the only screen). --interactive lets clicks through to the
+                     page; by default the window ignores the mouse entirely.
+  wallpaper stop     Stop it and leave nothing behind
+  wallpaper status   Say whether it is running (exit 0 running, 1 not)
 
 Environment:
   PORT                  Port to serve on (default 5274)
@@ -486,6 +792,7 @@ main() {
     build) cmd_build ;;
     install-app) cmd_install_app ;;
     uninstall-app) cmd_uninstall_app ;;
+    wallpaper) cmd_wallpaper "$@" ;;
     help | -h | --help) usage ;;
     *)
       echo "Unknown command: $cmd" >&2

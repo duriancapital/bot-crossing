@@ -76,6 +76,25 @@ their own. Everything a URL sets is for **that page view only**: it never reache
 stored settings or the colony file, so opening the colony in a normal tab afterwards still comes
 up the way you left it.
 
+**The window itself is in the repo.** `wallpaper/BotCrossingWallpaper.swift` is one file with no
+packages and no Xcode project — short enough to read in a sitting, which is the point of not
+handing your desktop to a wallpaper app you did not write. It puts a Safari-engine web view into a
+borderless window one notch below the desktop icons on the display you name, click-through, with no
+Dock icon, reconnecting with backoff while the server is down and reloading after sleep. Built by
+`swiftc` from the Command Line Tools and ad-hoc signed, which is all a locally built app needs.
+
+```bash
+bin/bot-crossing wallpaper start                   # side monitor if there is one, else the built-in
+bin/bot-crossing wallpaper start --display "DELL"  # part of a display's name, or index N, or main
+bin/bot-crossing wallpaper stop
+bin/bot-crossing wallpaper status
+```
+
+`start` brings the server up first and builds the app when the source is newer than the binary.
+`--url` overrides the page it shows (the default is the low-cost URL above), `--interactive`
+lets clicks through to the page. A plain `bin/bot-crossing stop` takes the wallpaper down with the
+server, and `data/wallpaper.log` says what it is doing.
+
 ## Which harnesses work
 
 A **harness** is whatever actually runs your threads. Bot Crossing reads each one's local
